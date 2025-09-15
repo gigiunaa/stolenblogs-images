@@ -1,63 +1,109 @@
 import os
-import base64
+import logging
 import requests
 from flask import Flask, request, jsonify
-import openai
+from bs4 import BeautifulSoup
 
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-# Env variables (Render Dashboard → Environment)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-WIX_API_KEY = os.environ.get("WIX_API_KEY")
-WIX_FOLDER_ID = os.environ.get("WIX_FOLDER_ID")
+def clean_html(soup):
+    # წაშლის <style>, <script>, <svg>, <noscript>
+    for tag in soup(["style", "script", "svg", "noscript"]):
+        tag.decompose()
 
-openai.api_key = OPENAI_API_KEY
+    # base64 img → ამოშალე
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if src and src.startswith("data:image"):
+            img.decompose()
 
+    # ატრიბუტების გაწმენდა
+    for tag in soup.find_all(True):
+        if tag.name == "a":
+            if "href" in tag.attrs:
+                del tag.attrs["href"]
 
-@app.route("/process-images", methods=["POST"])
-def process_images():
+        elif tag.name == "img":
+            src = tag.get("src")
+            alt = tag.get("alt", "").strip() or "Image"
+            tag.attrs = {"src": src, "alt": alt}
+
+        else:
+            for attr in list(tag.attrs.keys()):
+                if attr not in ["src", "alt"]:
+                    del tag.attrs[attr]
+
+    # ❌ wrapper <div>-ების მოცილება
+    for div in soup.find_all("div"):
+        if not div.attrs and len(div.contents) == 1:
+            div.unwrap()
+        elif not div.attrs and not div.get_text(strip=True) and not div.find("img"):
+            div.decompose()
+
+    for div in soup.find_all("div"):
+        div.unwrap()
+
+    return soup
+
+def extract_blog_content(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+
+    # მთავარი article მოძებნე
+    article = soup.find("article")
+    if not article:
+        for cls in ["blog-content", "post-content", "entry-content", "content", "article-body"]:
+            article = soup.find("div", class_=cls)
+            if article:
+                break
+    if not article:
+        article = soup.body
+
+    # არასასურველი selectors
+    remove_selectors = [
+        "ul.entry-meta",
+        "div.entry-tags",
+        "div.ct-share-box",
+        "div.author-box",
+        "nav.post-navigation",
+        "div.wp-block-buttons",
+        "aside",
+        "header .entry-meta",
+        "footer"
+    ]
+    for sel in remove_selectors:
+        for tag in article.select(sel):
+            tag.decompose()
+
+    article = clean_html(article)
+    return article
+
+@app.route("/scrape-blog", methods=["POST"])
+def scrape_blog():
     try:
         data = request.get_json(force=True)
-        images = data.get("images", [])
-        if not images:
-            return jsonify({"error": "Missing 'images' array"}), 400
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "Missing 'url' field"}), 400
 
-        restyled_urls = []
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
 
-        for idx, src_url in enumerate(images):
-            # 1. OpenAI image restyle
-            result = openai.images.generate(
-                model="gpt-image-1",
-                prompt="Restyle this image into Gegidze brand style (blue #1663FF, white text strips, modern clean look)",
-                size="1024x1024",
-                image=[src_url]
-            )
+        article = extract_blog_content(resp.text)
+        if not article:
+            return jsonify({"error": "Could not extract blog content"}), 422
 
-            img_b64 = result.data[0].b64_json
-            img_bytes = base64.b64decode(img_b64)
+        clean_html_str = str(article).strip()
+        images = [img.get("src") for img in article.find_all("img") if img.get("src")]
 
-            # 2. Upload to Wix Media Manager
-            upload_resp = requests.post(
-                "https://www.wixapis.com/media/v1/files/import",
-                headers={
-                    "Authorization": WIX_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "fileName": f"blog_image_{idx+1}.png",
-                    "content": f"data:image/png;base64,{img_b64}",
-                    "parentFolderId": WIX_FOLDER_ID
-                }
-            )
-            upload_resp.raise_for_status()
-            wix_url = upload_resp.json()["file"]["media"]["url"]
-            restyled_urls.append(wix_url)
-
-        return jsonify({"restyled_images": restyled_urls})
+        return jsonify({
+            "html": clean_html_str,
+            "images": images
+        })
 
     except Exception as e:
+        logging.exception("Error scraping blog")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
