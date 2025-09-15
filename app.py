@@ -12,10 +12,10 @@ def clean_html(soup):
     for tag in soup(["style", "script", "svg", "noscript"]):
         tag.decompose()
 
-    # base64 img → ამოშალე
+    # base64 img → წაშალე
     for img in soup.find_all("img"):
         src = img.get("src", "")
-        if src and src.startswith("data:image"):
+        if src.startswith("data:image"):
             img.decompose()
 
     # ატრიბუტების გაწმენდა
@@ -34,7 +34,7 @@ def clean_html(soup):
                 if attr not in ["src", "alt"]:
                     del tag.attrs[attr]
 
-    # ❌ wrapper <div>-ების მოცილება
+    # wrapper div-ების მოცილება
     for div in soup.find_all("div"):
         if not div.attrs and len(div.contents) == 1:
             div.unwrap()
@@ -75,8 +75,7 @@ def extract_blog_content(html: str):
         for tag in article.select(sel):
             tag.decompose()
 
-    article = clean_html(article)
-    return article
+    return clean_html(article)
 
 @app.route("/scrape-blog", methods=["POST"])
 def scrape_blog():
@@ -93,7 +92,10 @@ def scrape_blog():
         if not article:
             return jsonify({"error": "Could not extract blog content"}), 422
 
+        # HTML ტექსტი
         clean_html_str = str(article).strip()
+
+        # სურათების სია
         images = [img.get("src") for img in article.find_all("img") if img.get("src")]
 
         return jsonify({
